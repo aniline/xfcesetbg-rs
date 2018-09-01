@@ -1,13 +1,14 @@
 extern crate dbus;
 extern crate regex;
 
-// use std::collections::HashMap;
+use std::collections::HashSet;
 use std::iter::FromIterator;
 use std::error::*;
 use std::fmt;
 
 use dbus::{Connection, BusType, Message};
 use dbus::arg::{Array, Dict, Variant, RefArg};
+use regex::Regex;
 
 const XFCONF_BUS  : &str = "org.xfce.Xfconf";
 const XFCONF_PATH : &str = "/org/xfce/Xfconf";
@@ -16,13 +17,14 @@ const XFCONF_DESKTOP_CHANNEL : &str = "xfce4-desktop";
 
 struct XFCEDesktop {
     conn: Connection,
-    // monitors: Vec<String>,
+    monitors: HashSet<String>,
 }
 
 #[derive(Debug)]
 enum XFConfError {
     CallError(String),
     DBusError(dbus::Error),
+    RegexError(regex::Error),
 }
 
 impl From<dbus::Error> for XFConfError {
@@ -37,16 +39,26 @@ impl From<String> for XFConfError {
     }
 }
 
+impl From<regex::Error> for XFConfError {
+    fn from(e: regex::Error) -> Self {
+        XFConfError::RegexError(e)
+    }
+}
+
 impl Error for XFConfError {
     fn description(&self) -> &str {
         match self {
             &XFConfError::CallError(ref s) => s.as_str(),
             &XFConfError::DBusError(ref dbe) => dbe.message().unwrap_or("<NoMessage>"),
+            &XFConfError::RegexError(ref ree) => ree.description(),
         }
     }
 
     fn cause(&self) -> Option<&Error> {
-        None
+        match self {
+            &XFConfError::RegexError(ref ree) => ree.cause(),
+            _ => None
+        }
     }
 }
 
@@ -57,10 +69,13 @@ impl fmt::Display for XFConfError {
 }
 
 impl XFCEDesktop {
-    fn new() -> Result<XFCEDesktop, dbus::Error> {
-        let xfcedesktop = XFCEDesktop {
+    fn new() -> Result<XFCEDesktop, XFConfError> {
+        let mut xfcedesktop = XFCEDesktop {
             conn: Connection::get_private(BusType::Session)?,
+            monitors: HashSet::new(),
         };
+
+        xfcedesktop.monitors = xfcedesktop.get_monitors()?;
         Ok(xfcedesktop)
     }
 
@@ -82,24 +97,23 @@ impl XFCEDesktop {
         Ok(Some(Vec::from_iter(arr.map(|x| x.to_owned()))))
     }
 
-    fn prop_test(&self) -> Result<(),XFConfError> {
+    fn get_monitors(&self) -> Result<HashSet<String>,XFConfError> {
         let m = self.call_func2("GetAllProperties", XFCONF_DESKTOP_CHANNEL, "/backdrop/screen0")?;
         let z: Dict<&str, Variant<Box<RefArg>>, _> = m.get1().unwrap();
-        let mut keys = z.map(|(x,_)| x).collect::<Vec<&str>>();
-        keys.sort();
+        let actual_monitor_re = Regex::new(r"/backdrop/screen0/monitor(.*)/workspace0/color-style")?;
+        let mons: HashSet<String> = HashSet::from_iter(z.map(|(x,_)| x)
+                                                       .map(|fld| actual_monitor_re.captures(fld))
+                                                       .filter(Option::is_some)
+                                                       .map(|c| c.unwrap().get(1).unwrap().as_str().to_owned()));
 
-        // let actual_monitor_re = Regex::new("/backdrop/screen0/monitorHDMI-0/workspace0/color-style").map_err(?;
-        for k in keys {
-            println!("{}", k);
-        }
-        Ok(())
+        Ok(mons)
     }
 }
 
 fn main() {
     let xd = XFCEDesktop::new().unwrap();
-    match xd.prop_test() {
-        Ok(_) => (),
-        Err(e) => println!("Boinked.. {}", e)
+    println!("Monitors:");
+    for m in xd.monitors.iter() {
+        println!("-> {}", m);
     }
 }

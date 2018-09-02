@@ -1,6 +1,7 @@
 extern crate dbus;
 extern crate regex;
 
+use std::env;
 use std::collections::HashSet;
 use std::iter::FromIterator;
 use std::error::*;
@@ -18,6 +19,7 @@ const XFCONF_DESKTOP_CHANNEL : &str = "xfce4-desktop";
 struct XFCEDesktop {
     conn: Connection,
     monitors: HashSet<String>,
+    _mon_re: Regex,
 }
 
 #[derive(Debug)]
@@ -25,6 +27,8 @@ enum XFConfError {
     CallError(String),
     DBusError(dbus::Error),
     RegexError(regex::Error),
+    BadType,
+    NoData,
 }
 
 impl From<dbus::Error> for XFConfError {
@@ -51,6 +55,8 @@ impl Error for XFConfError {
             &XFConfError::CallError(ref s) => s.as_str(),
             &XFConfError::DBusError(ref dbe) => dbe.message().unwrap_or("<NoMessage>"),
             &XFConfError::RegexError(ref ree) => ree.description(),
+            &XFConfError::BadType => "Incorrect type.",
+            &XFConfError::NoData => "Message does not have data at that position",
         }
     }
 
@@ -73,47 +79,65 @@ impl XFCEDesktop {
         let mut xfcedesktop = XFCEDesktop {
             conn: Connection::get_private(BusType::Session)?,
             monitors: HashSet::new(),
+            _mon_re: Regex::new(r"/backdrop/screen0/monitor(.*)/workspace0/color-style")?,
         };
 
         xfcedesktop.monitors = xfcedesktop.get_monitors()?;
         Ok(xfcedesktop)
     }
 
-    #[allow(dead_code)]
-    fn call_func0(&self, method: &str) -> Result<Message, XFConfError> {
-        let m = Message::new_method_call(XFCONF_BUS, XFCONF_PATH, XFCONF_OBJ, method)?;
-        Ok(self.conn.send_with_reply_and_block(m, 2000)?)
-    }
-
-    fn call_func2(&self, method: &str, p1: &str, p2: &str) -> Result<Message, XFConfError> {
-        let m = Message::new_method_call(XFCONF_BUS, XFCONF_PATH, XFCONF_OBJ, method)?.append2(p1, p2);
-        Ok(self.conn.send_with_reply_and_block(m, 2000)?)
+    fn mk_call(&self, method: &str) -> Result<Message, XFConfError> {
+        Ok(Message::new_method_call(XFCONF_BUS, XFCONF_PATH, XFCONF_OBJ, method)?)
     }
 
     #[allow(dead_code)]
-    fn get_channels(&self) -> Result<Option<Vec<String>>,XFConfError> {
-        let m = self.call_func0("ListChannels")?;
-        let arr: Array<&str,_> = m.get1().unwrap();
-        Ok(Some(Vec::from_iter(arr.map(|x| x.to_owned()))))
+    fn call_method(&self, msg: Message) -> Result<Message, XFConfError> {
+        Ok(self.conn.send_with_reply_and_block(msg, 2000)?)
     }
 
+    fn get_background(&self, _monitor: &str, _workspace: &str) -> Result<String, XFConfError> {
+        let prop_path = format!("/backdrop/screen0/monitor{monitor}/workspace{workspace}/last-image",
+                                monitor = _monitor, workspace = _workspace);
+        let m = self.call_method(self.mk_call("GetProperty")?.append2(XFCONF_DESKTOP_CHANNEL, &prop_path))?;
+        let v: Variant<Box<RefArg>> = m.get1().ok_or(XFConfError::NoData)?;
+        let z: &str = v.as_str().ok_or(XFConfError::BadType)?;
+        Ok(z.to_string())
+    }
+
+    #[allow(dead_code)]
+    fn set_background(&self, _monitor: &str, _workspace: &str, _image_path: &str) -> Result<(), XFConfError> {
+        let prop_path = format!("/backdrop/screen0/monitor{monitor}/workspace{workspace}/last-image",
+                                monitor = _monitor, workspace = _workspace);
+        let img_path_v = Variant(_image_path);
+        self.call_method(self.mk_call("SetProperty")?.append3(XFCONF_DESKTOP_CHANNEL, &prop_path, &img_path_v))?;
+        Ok(())
+    }
+
+    /// Scrape monitors from the property list.
     fn get_monitors(&self) -> Result<HashSet<String>,XFConfError> {
-        let m = self.call_func2("GetAllProperties", XFCONF_DESKTOP_CHANNEL, "/backdrop/screen0")?;
+        let m = self.call_method(self.mk_call("GetAllProperties")?.append2(XFCONF_DESKTOP_CHANNEL, "/backdrop/screen0"))?;
         let z: Dict<&str, Variant<Box<RefArg>>, _> = m.get1().unwrap();
-        let actual_monitor_re = Regex::new(r"/backdrop/screen0/monitor(.*)/workspace0/color-style")?;
         let mons: HashSet<String> = HashSet::from_iter(z.map(|(x,_)| x)
-                                                       .map(|fld| actual_monitor_re.captures(fld))
+                                                       .map(|fld| self._mon_re.captures(fld))
                                                        .filter(Option::is_some)
-                                                       .map(|c| c.unwrap().get(1).unwrap().as_str().to_owned()));
-
+                                                       .map(|c| c.unwrap().get(1).unwrap().as_str().to_string()));
         Ok(mons)
     }
 }
 
+///
+/// Current usage: prog <image-file>
+///
 fn main() {
-    let xd = XFCEDesktop::new().unwrap();
+    let ag = env::args().nth(1);
+    let xfconf = XFCEDesktop::new().unwrap();
+
     println!("Monitors:");
-    for m in xd.monitors.iter() {
-        println!("-> {}", m);
+    for m in xfconf.monitors.iter() {
+        println!("{} Img = {}", m, xfconf.get_background(m, "0").unwrap());
+        if let &Some(ref img) = &ag {
+            println!("Setting {}", &img);
+            xfconf.set_background(m, "0", img.as_str()).expect("Failed.");
+        }
     }
 }

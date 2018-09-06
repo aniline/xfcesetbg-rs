@@ -1,17 +1,22 @@
+//
 extern crate dbus;
 extern crate regex;
 extern crate getopts;
+extern crate rand;
 
 use std::env;
 use std::error::*;
 use std::fmt;
-use std::fs;
+use std::fs::{metadata, File};
 use std::io;
+use std::io::Read;
 
 use dbus::{Connection, BusType, Message};
 use dbus::arg::{Dict, Variant, RefArg};
 use regex::Regex;
 use getopts::Options;
+use rand::{Rng, FromEntropy};
+use rand::rngs::SmallRng;
 
 const XFCONF_BUS  : &str = "org.xfce.Xfconf";
 const XFCONF_PATH : &str = "/org/xfce/Xfconf";
@@ -25,16 +30,26 @@ struct XFCEDesktop {
     _mon_re: Regex,
 }
 
+/// Wrapped error used in this program.
 #[derive(Debug)]
 enum XFConfError {
+    /// String error from dbus::Message functions
     CallError(String),
+    /// Wrapped Error from dbus::Connection functions and many others.
     DBusError(dbus::Error),
+    /// Wrapped regex Error
     RegexError(regex::Error),
+    /// Wrapped error from file operations
     IOError(io::Error),
+    /// Could not pull out the data of expected type from a response variant.
     BadType,
+    /// Indicating that from Message::get() gave a 'None'.
     NoData,
+    /// Could not pick one images
+    NoImage,
 }
 
+// Transform impl's for various error types used to XFConfError.
 impl From<dbus::Error> for XFConfError {
     fn from(e: dbus::Error) -> Self {
         XFConfError::DBusError(e)
@@ -67,6 +82,7 @@ impl Error for XFConfError {
             &XFConfError::RegexError(ref ree) => ree.description(),
             &XFConfError::BadType => "Incorrect type.",
             &XFConfError::NoData => "Message does not have data at that position",
+            &XFConfError::NoImage => "Could not pick an image from the list",
             &XFConfError::IOError(ref e) => e.description(),
         }
     }
@@ -101,7 +117,6 @@ impl XFCEDesktop {
         Ok(Message::new_method_call(XFCONF_BUS, XFCONF_PATH, XFCONF_OBJ, method)?)
     }
 
-    #[allow(dead_code)]
     fn call_method(&self, msg: Message) -> Result<Message, XFConfError> {
         Ok(self.conn.send_with_reply_and_block(msg, 2000)?)
     }
@@ -115,7 +130,6 @@ impl XFCEDesktop {
         Ok(z.to_string())
     }
 
-    #[allow(dead_code)]
     fn set_background(&self, _monitor: &str, _workspace: &str, _image_path: &str) -> Result<(), XFConfError> {
         let prop_path = format!("/backdrop/screen0/monitor{monitor}/workspace{workspace}/last-image",
                                 monitor = _monitor, workspace = _workspace);
@@ -145,13 +159,61 @@ impl XFCEDesktop {
         Ok(z.to_string())
     }
 
-    fn is_list_valid(&self, _list: &str) -> Result<(), XFConfError> {
-        let _list_attr = fs::metadata(_list)?;
+    fn get_image_names(&self, _list: &str) -> Result<Vec<String>, XFConfError> {
+        let mut contents = String::new();
+        File::open(_list)?.read_to_string(&mut contents)?;
+        Ok(contents.lines().map(str::trim).filter(|x| !x.starts_with("#")).map(str::to_string).collect::<Vec<String>>())
+    }
+
+    fn pick_image(&self, image_names: &Vec<String>) -> Result<String, XFConfError> {
+        let mut _rng = SmallRng::from_entropy();
+        let mut imgs = image_names.iter().collect::<Vec<&String>>();
+        imgs.sort();
+        imgs.dedup();
+        let mut lsize = imgs.len();
+
+        while lsize > 0 {
+            let picked_idx = _rng.gen_range(0, lsize);
+            match metadata(&imgs[picked_idx]) {
+                Err(_) => {
+                    imgs.remove(picked_idx);
+                    lsize = imgs.len();
+                },
+                Ok(_) => {
+                    return Ok(imgs[picked_idx].to_string());
+                }
+            }
+        }
+
+        Err(XFConfError::NoImage)
+    }
+
+    #[allow(dead_code)]
+    fn rotate_background_for_monitor(&self, _monitor: &str, _workspace: &str, image_list: &Vec<String>) -> Result<(), XFConfError> {
+        self.set_background(_monitor, _workspace, self.pick_image(image_list)?.as_str())?;
         Ok(())
     }
 
+    fn rotate_background(&self, _workspace: &str, image_list: &Vec<String>) -> Result<(), XFConfError> {
+        for m in &self.monitors {
+            self.set_background(m.as_str(), _workspace, self.pick_image(image_list)?.as_str())?;
+        }
+        Ok(())
+    }
+
+    fn rotate_from_saved(&self) -> Result<(), XFConfError> {
+        let image_names = self.get_image_names(self.get_list()?.as_str())?;
+        self.rotate_background("0", &image_names)?;
+        Ok(())
+    }
+
+    /// Sets list file name to xfce desktop config registry
+    /// Additionally checks if the list file is readable and atleast one image file exists in it.
     fn set_list(&self, _list: &str) -> Result<(), XFConfError> {
-        self.is_list_valid(_list)?;
+        let _list_attr = metadata(_list)?;
+
+        let image_list =self.get_image_names(_list)?;
+        self.pick_image(&image_list)?;
 
         let list_v = Variant(_list);
         self.call_method(self.mk_call("SetProperty")?.append3(XFCONF_DESKTOP_CHANNEL, XFCONF_BACKDROP_LIST_PATH, list_v))?;
@@ -168,6 +230,10 @@ fn do_query(xfconf: &XFCEDesktop) {
     println!("Monitors:");
     for m in xfconf.monitors.iter() {
         println!("{} Img = {}", m, xfconf.get_background(m, "0").unwrap());
+    }
+    match xfconf.get_list() {
+        Ok(list) => println!("Current list is : {}", list),
+        Err(e) =>   println!("Could not get list, {}", e),
     }
 }
 
@@ -199,6 +265,12 @@ fn do_setimg(xfconf: &XFCEDesktop, imgfile_args: &Vec<String>) {
     }
 }
 
+fn do_rotate(xfconf: &XFCEDesktop) {
+    if let Err(e) = xfconf.rotate_from_saved() {
+        println!("Failed: {}", e);
+    }
+}
+
 ///
 /// Current usage: prog <image-file>
 ///
@@ -209,9 +281,10 @@ fn main() {
 
     let mut opts = Options::new();
 
-    opts.optopt  ("l", "listfile", "set backdrop list file name", "LISTFILE");
-    opts.optflag ("q", "query",    "query the current setting");
-    opts.optflag ("h", "help",     "this help");
+    opts.optopt  ("l", "listfile", "Set backdrop list file name", "LISTFILE");
+    opts.optflag ("q", "query",    "Query the current setting");
+    opts.optflag ("h", "help",     "This help");
+    opts.optflag ("n", "norotate", "Do not set the backgrounds from list file while setting it");
 
     let matches = match opts.parse(&args[1..]) {
         Ok(m) => { m }
@@ -243,5 +316,8 @@ fn main() {
 
     if !matches.free.is_empty() {
         do_setimg(&xfconf, &matches.free);
-    };
+    }
+    else if !matches.opt_present("n"){
+        do_rotate(&xfconf);
+    }
 }

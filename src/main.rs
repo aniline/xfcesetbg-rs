@@ -1,4 +1,11 @@
-//
+///
+/// Utility to emulate desktop backdrop 'list' behaviour of
+/// pre 4.12 XFCE.
+///
+/// TODO:
+/// * Multiple Workspaces
+/// * Daemon
+///
 extern crate dbus;
 extern crate regex;
 extern crate getopts;
@@ -152,6 +159,7 @@ impl XFCEDesktop {
         Ok(mons_set)
     }
 
+    /// Gets the list file name saved in an 'old' config variable
     fn get_list(&self) -> Result<String, XFConfError> {
         let m = self.call_method(self.mk_call("GetProperty")?.append2(XFCONF_DESKTOP_CHANNEL, XFCONF_BACKDROP_LIST_PATH))?;
         let v: Variant<Box<RefArg>> = m.get1().ok_or(XFConfError::NoData)?;
@@ -159,12 +167,15 @@ impl XFCEDesktop {
         Ok(z.to_string())
     }
 
+    /// Filter out comments and get list of filenames.
     fn get_image_names(&self, _list: &str) -> Result<Vec<String>, XFConfError> {
         let mut contents = String::new();
         File::open(_list)?.read_to_string(&mut contents)?;
         Ok(contents.lines().map(str::trim).filter(|x| !x.starts_with("#")).map(str::to_string).collect::<Vec<String>>())
     }
 
+    /// Pick one image from a list of names provided. Checking if they are actual
+    /// file system entries. TODO: 'is file' ?
     fn pick_image(&self, image_names: &Vec<String>) -> Result<String, XFConfError> {
         let mut _rng = SmallRng::from_entropy();
         let mut imgs = image_names.iter().collect::<Vec<&String>>();
@@ -194,13 +205,18 @@ impl XFCEDesktop {
         Ok(())
     }
 
+    /// Randomly usable files from given list and set the backdrop for all the monitors
+    /// found in xfconf-desktop configuration.
     fn rotate_background(&self, _workspace: &str, image_list: &Vec<String>) -> Result<(), XFConfError> {
         for m in &self.monitors {
-            self.set_background(m.as_str(), _workspace, self.pick_image(image_list)?.as_str())?;
+            let img = self.pick_image(image_list)?;
+            println!("Setting image for monitor{} : {}", m, &img);
+            self.set_background(m.as_str(), _workspace, &img)?;
         }
         Ok(())
     }
 
+    /// Used the saved list file to set backdrops for all monitors.
     fn rotate_from_saved(&self) -> Result<(), XFConfError> {
         let image_names = self.get_image_names(self.get_list()?.as_str())?;
         self.rotate_background("0", &image_names)?;
@@ -226,29 +242,43 @@ fn print_usage(progname: &str, opts: Options) {
     print!("{}", opts.usage(&brief));
 }
 
+/// Print out the currently set list file name and file names of backdrop images
 fn do_query(xfconf: &XFCEDesktop) {
-    println!("Monitors:");
-    for m in xfconf.monitors.iter() {
-        println!("{} Img = {}", m, xfconf.get_background(m, "0").unwrap());
-    }
     match xfconf.get_list() {
-        Ok(list) => println!("Current list is : {}", list),
+        Ok(list) => println!("Current list file is : {}", list),
         Err(e) =>   println!("Could not get list, {}", e),
+    }
+    println!("Current image file(s) set:");
+    for m in xfconf.monitors.iter() {
+        println!("\t{} : {}", m, xfconf.get_background(m, "0").unwrap());
     }
 }
 
-fn do_setlist(xfconf: &XFCEDesktop, listfile: &String) {
+/// Shows current list, sets provided list if atleast one line in the list
+/// is a file. The `rotate` argument tells the function if it should
+/// attempt to set backdrops from the newly set list.
+fn do_setlist(xfconf: &XFCEDesktop, listfile: &String, rotate: bool) {
     match xfconf.get_list() {
         Ok(list) => println!("Current list is : {}", list),
         Err(e) =>   println!("Could not get list, {}", e),
     }
     println!("do_setlist(): Setting list = {}", listfile);
-    match xfconf.set_list(listfile) {
-        Err(e) => println!("Error setting list path to ({}): {}", listfile, e),
-        Ok(_) => ()
+    if let Err(e) = xfconf.set_list(listfile) {
+        println!("Error setting list path to ({}): {}", listfile, e);
+    }
+    else if rotate {
+        do_rotate(&xfconf);
     }
 }
 
+/// Accumulates bunch of arguments which are ':' separated and maps
+/// them on to the monitors inferred from the current xfce config.
+/// The monitor list is sorted which allows use of colon ':' to
+/// set an image file as backdrop for a specific monitor.
+///
+/// If the '-q' option shows monitors in an order like 'DP1', 'HDMI1'
+/// then the argument ':xyz.jpg' would set the backdrop for 'HDMI1'
+/// xyz.jpg
 fn do_setimg(xfconf: &XFCEDesktop, imgfile_args: &Vec<String>) {
     let imgfiles_collated = imgfile_args.join(":");
     let imgfiles: Vec<&str> = imgfiles_collated.split(":").collect();
@@ -272,7 +302,7 @@ fn do_rotate(xfconf: &XFCEDesktop) {
 }
 
 ///
-/// Current usage: prog <image-file>
+/// Current usage: prog -l <list-file> -q -h -n image-file:image-file:...
 ///
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -295,29 +325,39 @@ fn main() {
         }
     };
 
+    // Help
     if matches.opt_present("h") {
         print_usage(&progname, opts);
         return;
     }
 
+    // Query current
     if matches.opt_present("q") {
         do_query(&xfconf);
         return;
     }
 
+    // Set list
     if matches.opt_present("l") {
         if let Some(listfile) = matches.opt_str("l") {
-            do_setlist(&xfconf, &listfile);
+            do_setlist(&xfconf, &listfile, (!matches.opt_present("n")) && matches.free.is_empty());
+            // Some more image arguments
+            if matches.free.is_empty() {
+                return;
+            }
         }
+        // No list file given
         else {
             print_usage(&progname, opts);
         }
     }
 
+    // Remaining args as a collection of image:image:... image:image..
     if !matches.free.is_empty() {
         do_setimg(&xfconf, &matches.free);
     }
-    else if !matches.opt_present("n"){
+    // No args means rotate
+    else if !matches.opt_present("n") {
         do_rotate(&xfconf);
     }
 }

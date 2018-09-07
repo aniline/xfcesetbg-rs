@@ -19,7 +19,7 @@ use std::io;
 use std::io::Read;
 
 use dbus::{Connection, BusType, Message};
-use dbus::arg::{Dict, Variant, RefArg};
+use dbus::arg::{Dict, Variant, RefArg, cast};
 use regex::Regex;
 use getopts::Options;
 use rand::{Rng, FromEntropy};
@@ -30,11 +30,15 @@ const XFCONF_PATH : &str = "/org/xfce/Xfconf";
 const XFCONF_OBJ  : &str = "org.xfce.Xfconf";
 const XFCONF_DESKTOP_CHANNEL : &str = "xfce4-desktop";
 const XFCONF_BACKDROP_LIST_PATH : &str = "/backdrop/screen0/monitor0/image-path";
+const XFCONF_SINGLE_WORKSPACE_MODE : &str = "/backdrop/single-workspace-mode";
+const XFCONF_SINGLE_WORKSPACE_NUMBER : &str = "/backdrop/single-workspace-number";
 
 struct XFCEDesktop {
     conn: Connection,
     monitors: Vec<String>,
-    _mon_re: Regex,
+    workspace_count: u64,
+    single_mode: bool,
+    single_workspace: u64,
 }
 
 /// Wrapped error used in this program.
@@ -54,6 +58,8 @@ enum XFConfError {
     NoData,
     /// Could not pick one images
     NoImage,
+    /// COuld not figure out the monitors and workspace info
+    NoDesktopInfo,
 }
 
 // Transform impl's for various error types used to XFConfError.
@@ -90,6 +96,7 @@ impl Error for XFConfError {
             &XFConfError::BadType => "Incorrect type.",
             &XFConfError::NoData => "Message does not have data at that position",
             &XFConfError::NoImage => "Could not pick an image from the list",
+            &XFConfError::NoDesktopInfo => "Could get XFCE4 desktop and workspace configuration",
             &XFConfError::IOError(ref e) => e.description(),
         }
     }
@@ -113,10 +120,13 @@ impl XFCEDesktop {
         let mut xfcedesktop = XFCEDesktop {
             conn: Connection::get_private(BusType::Session)?,
             monitors: Vec::new(),
-            _mon_re: Regex::new(r"/backdrop/screen0/monitor(.*)/workspace0/color-style")?,
+            workspace_count: 0,
+            single_mode: true,
+            single_workspace: 0,
         };
 
-        xfcedesktop.monitors = xfcedesktop.get_monitors()?;
+        xfcedesktop.refresh_monitors_and_workspaces()?;
+        xfcedesktop.refresh_single_workspace_info()?;
         Ok(xfcedesktop)
     }
 
@@ -146,17 +156,62 @@ impl XFCEDesktop {
     }
 
     /// Scrape monitors from the property list.
-    fn get_monitors(&self) -> Result<Vec<String>,XFConfError> {
+    fn refresh_monitors_and_workspaces(&mut self) -> Result<(),XFConfError> {
+        let _mon_re = Regex::new(r"/backdrop/screen0/monitor(.*)/workspace(.*)/color-style")?;
+
         let m = self.call_method(self.mk_call("GetAllProperties")?.append2(XFCONF_DESKTOP_CHANNEL, "/backdrop/screen0"))?;
-        let z: Dict<&str, Variant<Box<RefArg>>, _> = m.get1().unwrap();
-        let mut mons_set: Vec<String> = z.map(|(x,_)| x)
-            .map(|fld| self._mon_re.captures(fld))
+        let props: Dict<&str, Variant<Box<RefArg>>, _> = m.get1().ok_or(XFConfError::NoData)?;
+        let prop_keys: Vec<String> = props.map(|(x,_)| x.to_string()).collect();
+
+        let mut mons_set: Vec<String> = prop_keys.iter().map(|fld| _mon_re.captures(fld))
             .filter(Option::is_some)
-            .map(|c| c.unwrap().get(1).unwrap().as_str().to_string())
+            .map(Option::unwrap)
+            .filter(|c| c.len() > 1)
+            .map(|c| c.get(1).unwrap().as_str().to_string())
             .collect();
+
         mons_set.sort();
         mons_set.dedup();
-        Ok(mons_set)
+
+        if mons_set.len() <= 0 {
+            return Err(XFConfError::NoDesktopInfo);
+        }
+
+        let workspaces_re =  Regex::new(&format!("/backdrop/screen0/monitor{monitor}/workspace.*/last-image",
+                                                 monitor = &mons_set[0].as_str()))?;
+        let workspace_count = prop_keys.iter().filter(|fld| workspaces_re.is_match(fld)).count();
+
+        self.monitors = mons_set;
+        self.workspace_count = workspace_count as u64;
+
+        Ok(())
+    }
+
+    fn refresh_single_workspace_info(&mut self) -> Result<(),XFConfError> {
+        let m_sws_mode = self.call_method(self.mk_call("GetProperty")?.append2(XFCONF_DESKTOP_CHANNEL, XFCONF_SINGLE_WORKSPACE_MODE))?;
+        let m_sws_num = self.call_method(self.mk_call("GetProperty")?.append2(XFCONF_DESKTOP_CHANNEL, XFCONF_SINGLE_WORKSPACE_NUMBER))?;
+        let v_mode: Variant<Box<RefArg>> = m_sws_mode.get1().ok_or(XFConfError::NoData)?;
+        let v_num: Variant<Box<RefArg>> = m_sws_num.get1().ok_or(XFConfError::NoData)?;
+        let mode = cast::<bool>(&v_mode.0).ok_or(XFConfError::NoData)?;
+        let num = v_num.as_i64().ok_or(XFConfError::NoData)?;
+
+        self.single_mode = *mode;
+        self.single_workspace = if num < 0 { 0 } else { num as u64 };
+        Ok(())
+    }
+
+    fn set_single_workspace_info(&self, mode: bool, workspace_number: Option<i64>) -> Result<(),XFConfError> {
+        self.call_method(self.mk_call("SetProperty")?
+                         .append3(XFCONF_DESKTOP_CHANNEL,
+                                  XFCONF_SINGLE_WORKSPACE_MODE,
+                                  Variant(mode)))?;
+        if let Some(n) = workspace_number {
+            self.call_method(self.mk_call("SetProperty")?
+                             .append3(XFCONF_DESKTOP_CHANNEL,
+                                      XFCONF_SINGLE_WORKSPACE_NUMBER,
+                                      Variant(n)))?;
+        }
+        Ok(())
     }
 
     /// Gets the list file name saved in an 'old' config variable
@@ -210,7 +265,7 @@ impl XFCEDesktop {
     fn rotate_background(&self, _workspace: &str, image_list: &Vec<String>) -> Result<(), XFConfError> {
         for m in &self.monitors {
             let img = self.pick_image(image_list)?;
-            println!("Setting image for monitor{} : {}", m, &img);
+            println!("Set for monitor{}, workspace{} : {}", m, _workspace, &img);
             self.set_background(m.as_str(), _workspace, &img)?;
         }
         Ok(())
@@ -219,7 +274,15 @@ impl XFCEDesktop {
     /// Used the saved list file to set backdrops for all monitors.
     fn rotate_from_saved(&self) -> Result<(), XFConfError> {
         let image_names = self.get_image_names(self.get_list()?.as_str())?;
-        self.rotate_background("0", &image_names)?;
+        if self.single_mode {
+            let wsp = format!("{}", self.single_workspace);
+            self.rotate_background(&wsp, &image_names)?;
+        } else {
+            for wsp_idx in 0..self.workspace_count {
+                let wsp = format!("{}", wsp_idx);
+                self.rotate_background(&wsp, &image_names)?;
+            }
+        }
         Ok(())
     }
 
@@ -242,15 +305,30 @@ fn print_usage(progname: &str, opts: Options) {
     print!("{}", opts.usage(&brief));
 }
 
-/// Print out the currently set list file name and file names of backdrop images
-fn do_query(xfconf: &XFCEDesktop) {
+fn do_fetch_list(xfconf: &XFCEDesktop) {
     match xfconf.get_list() {
         Ok(list) => println!("Current list file is : {}", list),
         Err(e) =>   println!("Could not get list, {}", e),
     }
+}
+
+/// Print out the currently set list file name and file names of backdrop images
+fn do_query(xfconf: &XFCEDesktop) {
+    do_fetch_list(xfconf);
     println!("Current image file(s) set:");
     for m in xfconf.monitors.iter() {
-        println!("\t{} : {}", m, xfconf.get_background(m, "0").unwrap());
+        println!(" {} : Mode = {}", m, if xfconf.single_mode { "single" } else { "seperate" } );
+        for wsp_idx in 0..xfconf.workspace_count {
+            let wsp = format!("{}", wsp_idx);
+            println!("\tworkspace {}{}: {}", wsp_idx,
+                     if wsp_idx == xfconf.single_workspace { "*" } else { " " },
+                     xfconf.get_background(m, &wsp).unwrap());
+        }
+    }
+
+    println!("Single backdrop mode = {}", xfconf.single_mode);
+    if xfconf.single_mode {
+        println!("Single backdrop mode workspace = {}", xfconf.single_workspace);
     }
 }
 
@@ -258,10 +336,7 @@ fn do_query(xfconf: &XFCEDesktop) {
 /// is a file. The `rotate` argument tells the function if it should
 /// attempt to set backdrops from the newly set list.
 fn do_setlist(xfconf: &XFCEDesktop, listfile: &String, rotate: bool) {
-    match xfconf.get_list() {
-        Ok(list) => println!("Current list is : {}", list),
-        Err(e) =>   println!("Could not get list, {}", e),
-    }
+    do_fetch_list(xfconf);
     println!("do_setlist(): Setting list = {}", listfile);
     if let Err(e) = xfconf.set_list(listfile) {
         println!("Error setting list path to ({}): {}", listfile, e);
@@ -295,9 +370,31 @@ fn do_setimg(xfconf: &XFCEDesktop, imgfile_args: &Vec<String>) {
     }
 }
 
+/// Cycle backdrops. Would cycle all workspaces if the single mode is false
 fn do_rotate(xfconf: &XFCEDesktop) {
     if let Err(e) = xfconf.rotate_from_saved() {
         println!("Failed: {}", e);
+    }
+}
+
+fn do_set_backdrop_mode(xfconf: &mut XFCEDesktop, mode: bool, workspace_num: Option<i64>, rotate: bool) {
+    if let Err(e) = match workspace_num {
+        Some(n) => xfconf.set_single_workspace_info(mode, if (n < 0) || (n >= (xfconf.workspace_count as i64)) {
+            println!("Workspace index ({}) outside valid range [{}..{}]. Not changing it.", n, 0, xfconf.workspace_count);
+            None
+        } else {
+            Some(n)
+        }),
+        None => xfconf.set_single_workspace_info(mode, None),
+    }
+    {
+        println!("Error setting backdrop mode: {}", e);
+    }
+    else if rotate {
+        if let Err(e) = xfconf.refresh_single_workspace_info() {
+            println!("Error refreshing single workspace info: {}", e);
+        }
+        do_rotate(&xfconf);
     }
 }
 
@@ -306,15 +403,17 @@ fn do_rotate(xfconf: &XFCEDesktop) {
 ///
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let xfconf = XFCEDesktop::new().unwrap();
+    let mut xfconf = XFCEDesktop::new().unwrap();
     let progname = args[0].clone();
 
     let mut opts = Options::new();
 
-    opts.optopt  ("l", "listfile", "Set backdrop list file name", "LISTFILE");
-    opts.optflag ("q", "query",    "Query the current setting");
-    opts.optflag ("h", "help",     "This help");
-    opts.optflag ("n", "norotate", "Do not set the backgrounds from list file while setting it");
+    opts.optflag    ("c", "cycle",    "Cycle backgrounds from list");
+    opts.optflag    ("h", "help",     "This help");
+    opts.optopt     ("l", "listfile", "Set backdrop list file name", "LISTFILE");
+    opts.optflag    ("m", "multiple", "Turn off using single backdrop across all workspaces. Dont use together with '-s'");
+    opts.optflagopt ("s", "single",   "Use backdrop from specified workspace for others.", "WORKSPACE_NUM");
+    opts.optflag    ("q", "query",    "Query the current setting");
 
     let matches = match opts.parse(&args[1..]) {
         Ok(m) => { m }
@@ -337,18 +436,45 @@ fn main() {
         return;
     }
 
+    let rotate = matches.opt_present("c");
+
+    if matches.opts_present(&["s".to_string(), "m".to_string(), "l".to_string()]) {
+        println!("Use -c to force a backdrop cycle.");
+    }
+
+    // Set single workspace mode
+    if matches.opt_present("s") || matches.opt_present("m") {
+        if matches.opt_present("s") && matches.opt_present("m") {
+            println!("Specify one of -s or -m");
+            return;
+        }
+
+        if matches.opt_present("s") {
+            let wsp_idx = matches.opt_str("s").map(|x| x.parse::<i64>().unwrap_or(-1));
+            match wsp_idx {
+                Some(-1) => println!("Bad workspace index specified : '{}'",
+                                     matches.opt_str("s").unwrap_or("?".to_string())),
+                _ => do_set_backdrop_mode(&mut xfconf, true, wsp_idx, rotate),
+            }
+            return;
+        }
+
+        if matches.opt_present("m") {
+            do_set_backdrop_mode(&mut xfconf, false, None, rotate);
+            return;
+        }
+    }
+
     // Set list
     if matches.opt_present("l") {
         if let Some(listfile) = matches.opt_str("l") {
-            do_setlist(&xfconf, &listfile, (!matches.opt_present("n")) && matches.free.is_empty());
-            // Some more image arguments
-            if matches.free.is_empty() {
+            do_setlist(&xfconf, &listfile, rotate);
                 return;
-            }
         }
         // No list file given
         else {
             print_usage(&progname, opts);
+            return;
         }
     }
 
@@ -357,7 +483,7 @@ fn main() {
         do_setimg(&xfconf, &matches.free);
     }
     // No args means rotate
-    else if !matches.opt_present("n") {
+    else {
         do_rotate(&xfconf);
     }
 }

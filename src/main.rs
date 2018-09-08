@@ -3,7 +3,6 @@
 /// pre 4.12 XFCE.
 ///
 /// TODO:
-/// * Multiple Workspaces
 /// * Daemon
 ///
 extern crate dbus;
@@ -265,7 +264,7 @@ impl XFCEDesktop {
     fn rotate_background(&self, _workspace: &str, image_list: &Vec<String>) -> Result<(), XFConfError> {
         for m in &self.monitors {
             let img = self.pick_image(image_list)?;
-            println!("Set for monitor{}, workspace{} : {}", m, _workspace, &img);
+            println!("monitor{}, workspace-{} : {}", m, _workspace, &img);
             self.set_background(m.as_str(), _workspace, &img)?;
         }
         Ok(())
@@ -278,8 +277,7 @@ impl XFCEDesktop {
             let wsp = format!("{}", self.single_workspace);
             self.rotate_background(&wsp, &image_names)?;
         } else {
-            for wsp_idx in 0..self.workspace_count {
-                let wsp = format!("{}", wsp_idx);
+            for wsp in self.workspace_names().iter() {
                 self.rotate_background(&wsp, &image_names)?;
             }
         }
@@ -298,10 +296,16 @@ impl XFCEDesktop {
         self.call_method(self.mk_call("SetProperty")?.append3(XFCONF_DESKTOP_CHANNEL, XFCONF_BACKDROP_LIST_PATH, list_v))?;
         Ok(())
     }
+
+    fn workspace_names(&self) -> Vec<String> {
+        (0..self.workspace_count).map(|x| format!("{}", x)).collect()
+    }
 }
 
 fn print_usage(progname: &str, opts: Options) {
-    let brief = format!("Usage: {} [options] [IMGFILE]:[IMGFILE]:[IMGFILE].. ", progname);
+    let brief = format!("Usage: {} [options] [IMGFILE]:[IMGFILE]:.. [IMGFILE]:..", progname)
+        + &format!("\n\nIMGFILES are mapped into (monitor, workspace) pairs.")
+        + &format!("\nThe monitors are sorted as indicated by the '-q' option");
     print!("{}", opts.usage(&brief));
 }
 
@@ -346,24 +350,38 @@ fn do_setlist(xfconf: &XFCEDesktop, listfile: &String, rotate: bool) {
     }
 }
 
-/// Accumulates bunch of arguments which are ':' separated and maps
-/// them on to the monitors inferred from the current xfce config.
-/// The monitor list is sorted which allows use of colon ':' to
-/// set an image file as backdrop for a specific monitor.
+/// Accepts ':' separated list of image file names and maps them on to
+/// the (monitor, workspace) inferred from the current xfce config.
+/// The (monitor, workspace) list is sorted which allows use of colon
+/// ':' to set an image file as backdrop for a specific monitor and
+/// workspace.
+///
+/// The repeat option repeats the image list on to the list of
+/// (monitor, workspace) pairs. If absent and the image list does not
+/// span the entire monitor x workspace range the remaining slots are
+/// untouched.
 ///
 /// If the '-q' option shows monitors in an order like 'DP1', 'HDMI1'
-/// then the argument ':xyz.jpg' would set the backdrop for 'HDMI1'
-/// xyz.jpg
-fn do_setimg(xfconf: &XFCEDesktop, imgfile_args: &Vec<String>) {
-    let imgfiles_collated = imgfile_args.join(":");
-    let imgfiles: Vec<&str> = imgfiles_collated.split(":").collect();
-    let imgpairs = imgfiles.iter()
-        .zip(xfconf.monitors.iter())
-        .filter(|&(i,_)| !i.is_empty());
+/// and totally 2 workspaces are there then the argument ':::xyz.jpg'
+/// would set the backdrop for 'HDMI1' and workspace 1 (workspace
+/// indices starts at 0) to xyz.jpg.
+fn do_setimg(xfconf: &XFCEDesktop, imgfiles_collated: &String, repeat: bool) {
+    let workspaces = xfconf.workspace_names();
+    let all_workspaces = xfconf.monitors.iter()
+        .flat_map(|x| workspaces
+                  .iter()
+                  .map(|y| (x.to_string(), y.to_string()))
+                  .collect::<Vec<(String, String)>>());
 
-    for (i, m) in imgpairs {
-        println!("do_setimg(): Monitor: {}, Image: {}", m, i);
-        match xfconf.set_background(m, "0", i) {
+    let imgpairs = if repeat {
+        imgfiles_collated.split(":").cycle().zip(all_workspaces).filter(|&(i,_)| !i.is_empty()).collect::<Vec<(&str,(String,String))>>()
+    } else {
+        imgfiles_collated.split(":").zip(all_workspaces).filter(|&(i,_)| !i.is_empty()).collect::<Vec<(&str,(String,String))>>()
+    };
+
+    for &(i, (ref m, ref w)) in imgpairs.iter() {
+        println!("monitor{}, workspace-{}: {}", m, w, i);
+        match xfconf.set_background(&m, &w, i) {
             Err(e) => println!("Failed : {} ", e),
             Ok(_) => ()
         }
@@ -412,8 +430,9 @@ fn main() {
     opts.optflag    ("h", "help",     "This help");
     opts.optopt     ("l", "listfile", "Set backdrop list file name", "LISTFILE");
     opts.optflag    ("m", "multiple", "Turn off using single backdrop across all workspaces. Dont use together with '-s'");
-    opts.optflagopt ("s", "single",   "Use backdrop from specified workspace for others.", "WORKSPACE_NUM");
+    opts.optflagopt ("s", "single",   "Use backdrop from specified workspace for others.", "WORKSPACE");
     opts.optflag    ("q", "query",    "Query the current setting");
+    opts.optflag    ("r", "repeat",   "When setting images directly repeat the image file list when not enough images indicated.");
 
     let matches = match opts.parse(&args[1..]) {
         Ok(m) => { m }
@@ -480,7 +499,7 @@ fn main() {
 
     // Remaining args as a collection of image:image:... image:image..
     if !matches.free.is_empty() {
-        do_setimg(&xfconf, &matches.free);
+        do_setimg(&xfconf, &matches.free.join(":"), matches.opt_present("r"));
     }
     // No args means rotate
     else {

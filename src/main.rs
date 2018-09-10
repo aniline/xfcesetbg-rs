@@ -187,15 +187,23 @@ impl XFCEDesktop {
     }
 
     fn refresh_single_workspace_info(&mut self) -> Result<(),XFConfError> {
-        let m_sws_mode = self.call_method(self.mk_call("GetProperty")?.append2(XFCONF_DESKTOP_CHANNEL, XFCONF_SINGLE_WORKSPACE_MODE))?;
-        let m_sws_num = self.call_method(self.mk_call("GetProperty")?.append2(XFCONF_DESKTOP_CHANNEL, XFCONF_SINGLE_WORKSPACE_NUMBER))?;
-        let v_mode: Variant<Box<RefArg>> = m_sws_mode.get1().ok_or(XFConfError::NoData)?;
-        let v_num: Variant<Box<RefArg>> = m_sws_num.get1().ok_or(XFConfError::NoData)?;
-        let mode = cast::<bool>(&v_mode.0).ok_or(XFConfError::NoData)?;
-        let num = v_num.as_i64().ok_or(XFConfError::NoData)?;
+        let m_sws_mode = self.call_method(self.mk_call("GetProperty")?.append2(XFCONF_DESKTOP_CHANNEL, XFCONF_SINGLE_WORKSPACE_MODE));
+        let m_sws_num = self.call_method(self.mk_call("GetProperty")?.append2(XFCONF_DESKTOP_CHANNEL, XFCONF_SINGLE_WORKSPACE_NUMBER));
 
-        self.single_mode = *mode;
-        self.single_workspace = if num < 0 { 0 } else { num as u64 };
+        // Those 'single-workspace-*' props might not be present always.
+        if m_sws_mode.is_err() || m_sws_num.is_err() {
+            self.single_mode = true;
+            self.single_workspace = 0;
+        }
+        else {
+            let v_mode: Variant<Box<RefArg>> = m_sws_mode?.get1().ok_or(XFConfError::NoData)?;
+            let v_num: Variant<Box<RefArg>> = m_sws_num?.get1().ok_or(XFConfError::NoData)?;
+            let mode = cast::<bool>(&v_mode.0).ok_or(XFConfError::NoData)?;
+            let num = v_num.as_i64().ok_or(XFConfError::NoData)?;
+
+            self.single_mode = *mode;
+            self.single_workspace = if num < 0 { 0 } else { num as u64 };
+        }
         Ok(())
     }
 
